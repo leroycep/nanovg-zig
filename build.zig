@@ -6,6 +6,14 @@ fn getRootDir() []const u8 {
 
 const root_dir = getRootDir();
 
+pub fn getPkg(zgl: std.build.Pkg) std.build.Pkg {
+    return .{
+        .name = "nanovg",
+        .source = .{ .path = root_dir ++ "/src/nanovg.zig" },
+        .dependencies = &.{zgl},
+    };
+}
+
 pub fn addNanoVGPackage(artifact: *std.build.LibExeObjStep, zgl: std.build.Pkg) void {
     artifact.addPackage(.{
         .name = "nanovg",
