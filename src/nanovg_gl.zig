@@ -4,12 +4,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
 const use_webgl = builtin.cpu.arch.isWasm();
-const gl = if (use_webgl)
-    @import("web/webgl.zig")
-else
-    @cImport({
-        @cInclude("glad/glad.h");
-    });
+const gl = @import("zgl");
 
 const logger = std.log.scoped(.nanovg_gl);
 
@@ -53,7 +48,7 @@ const GLContext = struct {
     view: [2]f32,
     textures: ArrayList(Texture),
     texture_id: i32 = 0,
-    vert_buf: gl.GLuint = 0,
+    vert_buf: gl.Buffer = .invalid,
     calls: ArrayList(Call),
     paths: ArrayList(Path),
     verts: ArrayList(internal.Vertex),
@@ -87,14 +82,6 @@ const GLContext = struct {
 
     fn castPtr(ptr: *anyopaque) *GLContext {
         return @ptrCast(*GLContext, @alignCast(@alignOf(*GLContext), ptr));
-    }
-
-    fn checkError(ctx: GLContext, str: []const u8) void {
-        if (!ctx.options.debug) return;
-        const err = gl.glGetError();
-        if (err != gl.GL_NO_ERROR) {
-            logger.err("GLError {X:0>8} after {s}", .{ err, str });
-        }
     }
 
     fn allocTexture(ctx: *GLContext) !*Texture {
@@ -132,57 +119,49 @@ const ShaderType = enum(u2) {
 };
 
 const Shader = struct {
-    prog: gl.GLuint,
-    frag: gl.GLuint,
-    vert: gl.GLuint,
+    prog: gl.Program,
+    frag: gl.Shader,
+    vert: gl.Shader,
 
-    view_loc: gl.GLint,
-    tex_loc: gl.GLint,
-    colormap_loc: gl.GLint,
-    frag_loc: gl.GLint,
+    view_loc: ?u32,
+    tex_loc: ?u32,
+    colormap_loc: ?u32,
+    frag_loc: ?u32,
 
     fn create(shader: *Shader, header: [:0]const u8, vertsrc: [:0]const u8, fragsrc: [:0]const u8) !void {
-        var status: gl.GLint = undefined;
-        var str: [2][*]const u8 = undefined;
-        var len: [2]gl.GLint = undefined;
-        str[0] = header.ptr;
-        len[0] = @intCast(gl.GLint, header.len);
+        var status: gl.Int = undefined;
 
         shader.* = std.mem.zeroes(Shader);
 
-        const prog = gl.glCreateProgram();
-        const vert = gl.glCreateShader(gl.GL_VERTEX_SHADER);
-        const frag = gl.glCreateShader(gl.GL_FRAGMENT_SHADER);
-        str[1] = vertsrc.ptr;
-        len[1] = @intCast(gl.GLint, vertsrc.len);
-        gl.glShaderSource(vert, 2, &str[0], &len[0]);
-        str[1] = fragsrc.ptr;
-        len[1] = @intCast(gl.GLint, fragsrc.len);
-        gl.glShaderSource(frag, 2, &str[0], &len[0]);
+        const prog = gl.createProgram();
+        const vert = gl.createShader(.vertex);
+        const frag = gl.createShader(.fragment);
+        gl.shaderSource(vert, 2, &.{ header, vertsrc });
+        gl.shaderSource(frag, 2, &.{ header, fragsrc });
 
-        gl.glCompileShader(vert);
-        gl.glGetShaderiv(vert, gl.GL_COMPILE_STATUS, &status);
-        if (status != gl.GL_TRUE) {
+        vert.compile();
+        status = vert.get(.compile_status);
+        if (status != 1) {
             printShaderErrorLog(vert, "shader", "vert");
             return error.ShaderCompilationFailed;
         }
 
-        gl.glCompileShader(frag);
-        gl.glGetShaderiv(frag, gl.GL_COMPILE_STATUS, &status);
-        if (status != gl.GL_TRUE) {
+        frag.compile();
+        status = frag.get(.compile_status);
+        if (status != 1) {
             printShaderErrorLog(frag, "shader", "frag");
             return error.ShaderCompilationFailed;
         }
 
-        gl.glAttachShader(prog, vert);
-        gl.glAttachShader(prog, frag);
+        prog.attach(vert);
+        prog.attach(frag);
 
-        gl.glBindAttribLocation(prog, 0, "vertex");
-        gl.glBindAttribLocation(prog, 1, "tcoord");
+        gl.bindAttribLocation(prog, 0, "vertex");
+        gl.bindAttribLocation(prog, 1, "tcoord");
 
-        gl.glLinkProgram(prog);
-        gl.glGetProgramiv(prog, gl.GL_LINK_STATUS, &status);
-        if (status != gl.GL_TRUE) {
+        prog.link();
+        status = prog.get(.link_status);
+        if (status != 1) {
             printProgramErrorLog(prog, "shader");
             return error.ProgramLinkingFailed;
         }
@@ -195,40 +174,34 @@ const Shader = struct {
     }
 
     fn delete(shader: Shader) void {
-        if (shader.prog != 0) gl.glDeleteProgram(shader.prog);
-        if (shader.vert != 0) gl.glDeleteShader(shader.vert);
-        if (shader.frag != 0) gl.glDeleteShader(shader.frag);
+        if (shader.prog != .invalid) gl.deleteProgram(shader.prog);
+        if (shader.vert != .invalid) gl.deleteShader(shader.vert);
+        if (shader.frag != .invalid) gl.deleteShader(shader.frag);
     }
 
     fn getUniformLocations(shader: *Shader) void {
-        shader.view_loc = gl.glGetUniformLocation(shader.prog, "viewSize");
-        shader.tex_loc = gl.glGetUniformLocation(shader.prog, "tex");
-        shader.colormap_loc = gl.glGetUniformLocation(shader.prog, "colormap");
-        shader.frag_loc = gl.glGetUniformLocation(shader.prog, "frag");
+        shader.view_loc = gl.getUniformLocation(shader.prog, "viewSize");
+        shader.tex_loc = gl.getUniformLocation(shader.prog, "tex");
+        shader.colormap_loc = gl.getUniformLocation(shader.prog, "colormap");
+        shader.frag_loc = gl.getUniformLocation(shader.prog, "frag");
     }
 
-    fn printShaderErrorLog(shader: gl.GLuint, name: []const u8, shader_type: []const u8) void {
-        var buf: [512]gl.GLchar = undefined;
-        var len: gl.GLsizei = 0;
-        gl.glGetShaderInfoLog(shader, 512, &len, &buf[0]);
-        if (len > 512) len = 512;
-        const log = buf[0..@intCast(usize, len)];
+    fn printShaderErrorLog(shader: gl.Shader, name: []const u8, shader_type: []const u8) void {
+        var buf: [512]u8 = undefined;
+        const log = gl.getShaderInfoLog(shader, &buf);
         logger.err("Shader {s}/{s} error:\n{s}", .{ name, shader_type, log });
     }
 
-    fn printProgramErrorLog(program: gl.GLuint, name: []const u8) void {
-        var buf: [512]gl.GLchar = undefined;
-        var len: gl.GLsizei = 0;
-        gl.glGetProgramInfoLog(program, 512, &len, &buf[0]);
-        if (len > 512) len = 512;
-        const log = buf[0..@intCast(usize, len)];
+    fn printProgramErrorLog(program: gl.Program, name: []const u8) void {
+        var buf: [512]u8 = undefined;
+        const log = gl.getProgramInfoLog(program, &buf);
         logger.err("Program {s} error:\n{s}", .{ name, log });
     }
 };
 
 const Texture = struct {
     id: i32,
-    tex: gl.GLuint,
+    tex: gl.Texture,
     width: i32,
     height: i32,
     tex_type: internal.TextureType,
@@ -236,10 +209,10 @@ const Texture = struct {
 };
 
 const Blend = struct {
-    src_rgb: gl.GLenum,
-    dst_rgb: gl.GLenum,
-    src_alpha: gl.GLenum,
-    dst_alpha: gl.GLenum,
+    src_rgb: gl.BlendFactor,
+    dst_rgb: gl.BlendFactor,
+    src_alpha: gl.BlendFactor,
+    dst_alpha: gl.BlendFactor,
 
     fn fromOperation(op: nvg.CompositeOperationState) Blend {
         return .{
@@ -250,19 +223,19 @@ const Blend = struct {
         };
     }
 
-    fn convertBlendFuncFactor(factor: nvg.BlendFactor) gl.GLenum {
+    fn convertBlendFuncFactor(factor: nvg.BlendFactor) gl.BlendFactor {
         return switch (factor) {
-            .zero => gl.GL_ZERO,
-            .one => gl.GL_ONE,
-            .src_color => gl.GL_SRC_COLOR,
-            .one_minus_src_color => gl.GL_ONE_MINUS_SRC_COLOR,
-            .dst_color => gl.GL_DST_COLOR,
-            .one_minus_dst_color => gl.GL_ONE_MINUS_DST_COLOR,
-            .src_alpha => gl.GL_SRC_ALPHA,
-            .one_minus_src_alpha => gl.GL_ONE_MINUS_SRC_ALPHA,
-            .dst_alpha => gl.GL_DST_ALPHA,
-            .one_minus_dst_alpha => gl.GL_ONE_MINUS_DST_ALPHA,
-            .src_alpha_saturate => gl.GL_SRC_ALPHA_SATURATE,
+            .zero => gl.BlendFactor.zero,
+            .one => gl.BlendFactor.one,
+            .src_color => gl.BlendFactor.src_color,
+            .one_minus_src_color => gl.BlendFactor.one_minus_src_color,
+            .dst_color => gl.BlendFactor.dst_color,
+            .one_minus_dst_color => gl.BlendFactor.one_minus_dst_color,
+            .src_alpha => gl.BlendFactor.src_alpha,
+            .one_minus_src_alpha => gl.BlendFactor.one_minus_src_alpha,
+            .dst_alpha => gl.BlendFactor.dst_alpha,
+            .one_minus_dst_alpha => gl.BlendFactor.one_minus_dst_alpha,
+            .src_alpha_saturate => gl.BlendFactor.src_alpha_saturate,
         };
     }
 };
@@ -290,56 +263,53 @@ const Call = struct {
         const paths = ctx.paths.items[call.path_offset..][0..call.path_count];
 
         // Draw shapes
-        gl.glEnable(gl.GL_STENCIL_TEST);
-        defer gl.glDisable(gl.GL_STENCIL_TEST);
-        gl.glStencilMask(0xff);
-        gl.glStencilFunc(gl.GL_ALWAYS, 0x0, 0xff);
-        gl.glColorMask(gl.GL_FALSE, gl.GL_FALSE, gl.GL_FALSE, gl.GL_FALSE);
+        gl.enable(.stencil_test);
+        defer gl.disable(.stencil_test);
+        gl.stencilMask(0xff);
+        gl.stencilFunc(.always, 0x0, 0xff);
+        gl.colorMask(false, false, false, false);
 
         // set bindpoint for solid loc
         setUniforms(ctx, call.uniform_offset, 0, 0);
-        ctx.checkError("fill simple");
 
-        gl.glStencilOpSeparate(gl.GL_FRONT, gl.GL_KEEP, gl.GL_KEEP, gl.GL_INCR_WRAP);
-        gl.glStencilOpSeparate(gl.GL_BACK, gl.GL_KEEP, gl.GL_KEEP, gl.GL_DECR_WRAP);
-        gl.glDisable(gl.GL_CULL_FACE);
+        gl.stencilOpSeparate(.front, .keep, .keep, .incr_wrap);
+        gl.stencilOpSeparate(.back, .keep, .keep, .decr_wrap);
+        gl.disable(.cull_face);
         for (paths) |path| {
-            gl.glDrawArrays(gl.GL_TRIANGLE_FAN, @intCast(gl.GLint, path.fill_offset), @intCast(gl.GLsizei, path.fill_count));
+            gl.drawArrays(.triangle_fan, path.fill_offset, path.fill_count);
         }
-        gl.glEnable(gl.GL_CULL_FACE);
+        gl.enable(.cull_face);
 
         // Draw anti-aliased pixels
-        gl.glColorMask(gl.GL_TRUE, gl.GL_TRUE, gl.GL_TRUE, gl.GL_TRUE);
+        gl.colorMask(true, true, true, true);
 
         setUniforms(ctx, call.uniform_offset + 1, call.image, call.colormap);
-        ctx.checkError("fill fill");
 
         if (ctx.options.antialias) {
-            gl.glStencilFunc(gl.GL_EQUAL, 0x00, 0xff);
-            gl.glStencilOp(gl.GL_KEEP, gl.GL_KEEP, gl.GL_KEEP);
+            gl.stencilFunc(.equal, 0x00, 0xff);
+            gl.stencilOp(.keep, .keep, .keep);
             // Draw fringes
             for (paths) |path| {
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, path.stroke_offset), @intCast(gl.GLsizei, path.stroke_count));
+                gl.drawArrays(.triangle_strip, path.stroke_offset, path.stroke_count);
             }
         }
 
         // Draw fill
-        gl.glStencilFunc(gl.GL_NOTEQUAL, 0x0, 0xff);
-        gl.glStencilOp(gl.GL_ZERO, gl.GL_ZERO, gl.GL_ZERO);
-        gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, call.triangle_offset), @intCast(gl.GLsizei, call.triangle_count));
+        gl.stencilFunc(.not_equal, 0x0, 0xff);
+        gl.stencilOp(.zero, .zero, .zero);
+        gl.drawArrays(.triangle_strip, call.triangle_offset, call.triangle_count);
     }
 
     fn convexFill(call: Call, ctx: *GLContext) void {
         const paths = ctx.paths.items[call.path_offset..][0..call.path_count];
 
         setUniforms(ctx, call.uniform_offset, call.image, call.colormap);
-        ctx.checkError("convex fill");
 
         for (paths) |path| {
-            gl.glDrawArrays(gl.GL_TRIANGLE_FAN, @intCast(gl.GLint, path.fill_offset), @intCast(gl.GLsizei, path.fill_count));
+            gl.drawArrays(.triangle_fan, path.fill_offset, path.fill_count);
             // Draw fringes
             if (path.stroke_count > 0) {
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, path.stroke_offset), @intCast(gl.GLsizei, path.stroke_count));
+                gl.drawArrays(.triangle_strip, path.stroke_offset, path.stroke_count);
             }
         }
     }
@@ -348,50 +318,47 @@ const Call = struct {
         const paths = ctx.paths.items[call.path_offset..][0..call.path_count];
 
         if (ctx.options.stencil_strokes) {
-            gl.glEnable(gl.GL_STENCIL_TEST);
-            defer gl.glDisable(gl.GL_STENCIL_TEST);
+            gl.enable(.stencil_test);
+            defer gl.disable(.stencil_test);
 
-            gl.glStencilMask(0xff);
+            gl.stencilMask(0xff);
 
             // Fill the stroke base without overlap
-            gl.glStencilFunc(gl.GL_EQUAL, 0x0, 0xff);
-            gl.glStencilOp(gl.GL_KEEP, gl.GL_KEEP, gl.GL_INCR);
+            gl.stencilFunc(.equal, 0x0, 0xff);
+            gl.stencilOp(.keep, .keep, .incr);
             setUniforms(ctx, call.uniform_offset + 1, call.image, call.colormap);
-            ctx.checkError("stroke fill 0");
             for (paths) |path| {
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, path.stroke_offset), @intCast(gl.GLsizei, path.stroke_count));
+                gl.drawArrays(.triangle_strip, path.stroke_offset, path.stroke_count);
             }
 
             // Draw anti-aliased pixels.
             setUniforms(ctx, call.uniform_offset, call.image, call.colormap);
-            gl.glStencilFunc(gl.GL_EQUAL, 0x00, 0xff);
-            gl.glStencilOp(gl.GL_KEEP, gl.GL_KEEP, gl.GL_KEEP);
+            gl.stencilFunc(.equal, 0x00, 0xff);
+            gl.stencilOp(.keep, .keep, .keep);
             for (paths) |path| {
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, path.stroke_offset), @intCast(gl.GLsizei, path.stroke_count));
+                gl.drawArrays(.triangle_strip, path.stroke_offset, path.stroke_count);
             }
 
             // Clear stencil buffer.
-            gl.glColorMask(gl.GL_FALSE, gl.GL_FALSE, gl.GL_FALSE, gl.GL_FALSE);
-            gl.glStencilFunc(gl.GL_ALWAYS, 0x0, 0xff);
-            gl.glStencilOp(gl.GL_ZERO, gl.GL_ZERO, gl.GL_ZERO);
-            ctx.checkError("stroke fill 1");
+            gl.colorMask(false, false, false, false);
+            gl.stencilFunc(.always, 0x0, 0xff);
+            gl.stencilOp(.zero, .zero, .zero);
             for (paths) |path| {
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, path.stroke_offset), @intCast(gl.GLsizei, path.stroke_count));
+                gl.drawArrays(.triangle_strip, path.stroke_offset, path.stroke_count);
             }
-            gl.glColorMask(gl.GL_TRUE, gl.GL_TRUE, gl.GL_TRUE, gl.GL_TRUE);
+            gl.colorMask(true, true, true, true);
         } else {
             setUniforms(ctx, call.uniform_offset, call.image, call.colormap);
             // Draw Strokes
             for (paths) |path| {
-                gl.glDrawArrays(gl.GL_TRIANGLE_STRIP, @intCast(gl.GLint, path.stroke_offset), @intCast(gl.GLsizei, path.stroke_count));
+                gl.drawArrays(.triangle_strip, path.stroke_offset, path.stroke_count);
             }
         }
     }
 
     fn triangles(call: Call, ctx: *GLContext) void {
         setUniforms(ctx, call.uniform_offset, call.image, call.colormap);
-        ctx.checkError("triangles fill");
-        gl.glDrawArrays(gl.GL_TRIANGLES, @intCast(gl.GLint, call.triangle_offset), @intCast(gl.GLsizei, call.triangle_count));
+        gl.drawArrays(.triangles, call.triangle_offset, call.triangle_count);
     }
 };
 
@@ -511,19 +478,19 @@ const FragUniforms = struct {
 
 fn setUniforms(ctx: *GLContext, uniform_offset: u32, image: i32, colormap: i32) void {
     const frag = &ctx.uniforms.items[uniform_offset];
-    gl.glUniform4fv(ctx.shader.frag_loc, 11, @ptrCast([*]f32, frag));
+    gl.uniform4fv(ctx.shader.frag_loc, @ptrCast([*][4]f32, frag)[0..11]);
 
     if (colormap != 0) {
         if (ctx.findTexture(colormap)) |tex| {
-            gl.glActiveTexture(gl.GL_TEXTURE0 + 1);
-            gl.glBindTexture(gl.GL_TEXTURE_2D, tex.tex);
-            gl.glActiveTexture(gl.GL_TEXTURE0 + 0);
+            gl.activeTexture(.texture_1);
+            tex.tex.bind(.@"2d");
+            gl.activeTexture(.texture_0);
         }
     }
 
     if (image != 0) {
         if (ctx.findTexture(image)) |tex| {
-            gl.glBindTexture(gl.GL_TEXTURE_2D, tex.tex);
+            tex.tex.bind(.@"2d");
         }
     }
     // // If no image is set, use empty texture
@@ -531,7 +498,6 @@ fn setUniforms(ctx: *GLContext, uniform_offset: u32, image: i32, colormap: i32) 
     // 	tex = glnvg__findTexture(gl->dummyTex);
     // }
     // glnvg__bindTexture(tex != NULL ? tex->tex : 0);
-    ctx.checkError("tex paint tex");
 }
 
 fn renderCreate(uptr: *anyopaque) !void {
@@ -542,7 +508,7 @@ fn renderCreate(uptr: *anyopaque) !void {
     const fragHeader = if (ctx.options.antialias) "#define EDGE_AA 1\n" else "";
     try ctx.shader.create(fragHeader, vertSrc, fragSrc);
 
-    gl.glGenBuffers(1, &ctx.vert_buf);
+    ctx.vert_buf = gl.genBuffer();
 
     // Some platforms does not allow to have samples to unset textures.
     // Create empty one which is bound when there's no texture specified.
@@ -553,45 +519,53 @@ fn renderCreateTexture(uptr: *anyopaque, tex_type: internal.TextureType, w: i32,
     const ctx = GLContext.castPtr(uptr);
     var tex: *Texture = try ctx.allocTexture();
 
-    gl.glGenTextures(1, &tex.tex);
+    tex.tex = gl.genTexture();
     tex.width = w;
     tex.height = h;
     tex.tex_type = tex_type;
     tex.flags = flags;
-    gl.glBindTexture(gl.GL_TEXTURE_2D, tex.tex);
-
-    if (!use_webgl) {
-        // GL 1.4 and later has support for generating mipmaps using a tex parameter.
-        if (flags.generate_mipmaps) {
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_GENERATE_MIPMAP, gl.GL_TRUE);
-        }
-    }
+    tex.tex.bind(.@"2d");
 
     switch (tex_type) {
         .none => {},
-        .alpha => gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_LUMINANCE, w, h, 0, gl.GL_LUMINANCE, gl.GL_UNSIGNED_BYTE, data),
-        .rgba => gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data),
+        .alpha => gl.textureImage2D(.@"2d", 0, .red, @intCast(usize, w), @intCast(usize, h), .red, .unsigned_byte, data),
+        .rgba => gl.textureImage2D(.@"2d", 0, .rgba, @intCast(usize, w), @intCast(usize, h), .rgba, .unsigned_byte, data),
     }
 
     if (flags.generate_mipmaps) {
-        const min_filter: gl.GLint = if (flags.nearest) gl.GL_NEAREST_MIPMAP_NEAREST else gl.GL_LINEAR_MIPMAP_LINEAR;
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, min_filter);
-    } else {
-        const min_filter: gl.GLint = if (flags.nearest) gl.GL_NEAREST else gl.GL_LINEAR;
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, min_filter);
-    }
-    const mag_filter: gl.GLint = if (flags.nearest) gl.GL_NEAREST else gl.GL_LINEAR;
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, mag_filter);
-
-    const wrap_s: gl.GLint = if (flags.repeat_x) gl.GL_REPEAT else gl.GL_CLAMP_TO_EDGE;
-    const wrap_t: gl.GLint = if (flags.repeat_y) gl.GL_REPEAT else gl.GL_CLAMP_TO_EDGE;
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, wrap_s);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, wrap_t);
-
-    if (use_webgl) {
-        if (flags.generate_mipmaps) {
-            gl.glGenerateMipmap(gl.GL_TEXTURE_2D);
+        if (flags.nearest) {
+            gl.texParameter(.@"2d", .min_filter, .nearest);
+        } else {
+            gl.texParameter(.@"2d", .min_filter, .linear_mipmap_linear);
         }
+    } else {
+        if (flags.nearest) {
+            gl.texParameter(.@"2d", .min_filter, .nearest);
+        } else {
+            gl.texParameter(.@"2d", .min_filter, .linear);
+        }
+    }
+
+    if (flags.nearest) {
+        gl.texParameter(.@"2d", .mag_filter, .nearest);
+    } else {
+        gl.texParameter(.@"2d", .mag_filter, .linear);
+    }
+
+    if (flags.repeat_x) {
+        gl.texParameter(.@"2d", .wrap_s, .repeat);
+    } else {
+        gl.texParameter(.@"2d", .wrap_s, .clamp_to_edge);
+    }
+
+    if (flags.repeat_y) {
+        gl.texParameter(.@"2d", .wrap_t, .repeat);
+    } else {
+        gl.texParameter(.@"2d", .wrap_t, .clamp_to_edge);
+    }
+
+    if (flags.generate_mipmaps) {
+        gl.generateMipmap(.@"2d");
     }
 
     return tex.id;
@@ -600,7 +574,7 @@ fn renderCreateTexture(uptr: *anyopaque, tex_type: internal.TextureType, w: i32,
 fn renderDeleteTexture(uptr: *anyopaque, image: i32) void {
     const ctx = GLContext.castPtr(uptr);
     const tex = ctx.findTexture(image) orelse return;
-    if (tex.tex != 0) gl.glDeleteTextures(1, &tex.tex);
+    if (tex.tex != .invalid) tex.tex.delete();
     tex.* = std.mem.zeroes(Texture);
 }
 
@@ -613,17 +587,17 @@ fn renderUpdateTexture(uptr: *anyopaque, image: i32, x_arg: i32, y: i32, w_arg: 
     // No support for all of skip, need to update a whole row at a time.
     const color_size: u32 = if (tex.tex_type == .rgba) 4 else 1;
     const y0: u32 = @intCast(u32, y * tex.width);
-    const data = &data_arg.?[y0 * color_size];
+    const data = @ptrCast([*]const u8, &data_arg.?[y0 * color_size]);
     const x = 0;
-    const w = tex.width;
+    const w = @intCast(usize, tex.width);
 
-    gl.glBindTexture(gl.GL_TEXTURE_2D, tex.tex);
+    tex.tex.bind(.@"2d");
     switch (tex.tex_type) {
         .none => {},
-        .alpha => gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, x, y, w, h, gl.GL_LUMINANCE, gl.GL_UNSIGNED_BYTE, data),
-        .rgba => gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, x, y, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data),
+        .alpha => gl.texSubImage2D(.@"2d", 0, x, @intCast(usize, y), w, @intCast(usize, h), .red, .unsigned_byte, data),
+        .rgba => gl.texSubImage2D(.@"2d", 0, x, @intCast(usize, y), w, @intCast(usize, h), .rgba, .unsigned_byte, data),
     }
-    gl.glBindTexture(gl.GL_TEXTURE_2D, 0);
+    gl.bindTexture(.invalid, .@"2d");
 
     return 1;
 }
@@ -656,35 +630,35 @@ fn renderFlush(uptr: *anyopaque) void {
 
     if (ctx.calls.items.len > 0) {
         // Setup required GL state.
-        gl.glUseProgram(ctx.shader.prog);
+        gl.useProgram(ctx.shader.prog);
 
-        gl.glEnable(gl.GL_CULL_FACE);
-        gl.glCullFace(gl.GL_BACK);
-        gl.glFrontFace(gl.GL_CCW);
-        gl.glEnable(gl.GL_BLEND);
-        gl.glDisable(gl.GL_DEPTH_TEST);
-        gl.glDisable(gl.GL_SCISSOR_TEST);
-        gl.glColorMask(gl.GL_TRUE, gl.GL_TRUE, gl.GL_TRUE, gl.GL_TRUE);
-        gl.glStencilMask(0xffffffff);
-        gl.glStencilOp(gl.GL_KEEP, gl.GL_KEEP, gl.GL_KEEP);
-        gl.glStencilFunc(gl.GL_ALWAYS, 0, 0xffffffff);
-        gl.glActiveTexture(gl.GL_TEXTURE0);
-        gl.glBindTexture(gl.GL_TEXTURE_2D, 0);
+        gl.enable(.cull_face);
+        gl.cullFace(.back);
+        gl.frontFace(.ccw);
+        gl.enable(.blend);
+        gl.disable(.depth_test);
+        gl.disable(.scissor_test);
+        gl.colorMask(true, true, true, true);
+        gl.stencilMask(0xffffffff);
+        gl.stencilOp(.keep, .keep, .keep);
+        gl.stencilFunc(.always, 0, 0xffffffff);
+        gl.activeTexture(.texture_0);
+        gl.bindTexture(.invalid, .@"2d");
 
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, ctx.vert_buf);
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, @intCast(gl.GLsizeiptr, ctx.verts.items.len * @sizeOf(internal.Vertex)), ctx.verts.items.ptr, gl.GL_STREAM_DRAW);
-        gl.glEnableVertexAttribArray(0);
-        gl.glEnableVertexAttribArray(1);
-        gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, @sizeOf(internal.Vertex), null);
-        gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, @sizeOf(internal.Vertex), @intToPtr(*anyopaque, 2 * @sizeOf(f32)));
+        ctx.vert_buf.bind(.array_buffer);
+        gl.bufferData(.array_buffer, internal.Vertex, ctx.verts.items, .stream_draw);
+        gl.enableVertexAttribArray(0);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(0, 2, .float, false, @sizeOf(internal.Vertex), 0);
+        gl.vertexAttribPointer(1, 2, .float, false, @sizeOf(internal.Vertex), 2 * @sizeOf(f32));
 
         // Set view and texture just once per frame.
-        gl.glUniform1i(ctx.shader.tex_loc, 0);
-        gl.glUniform1i(ctx.shader.colormap_loc, 1);
-        gl.glUniform2fv(ctx.shader.view_loc, 1, &ctx.view[0]);
+        gl.uniform1i(ctx.shader.tex_loc, 0);
+        gl.uniform1i(ctx.shader.colormap_loc, 1);
+        gl.uniform2fv(ctx.shader.view_loc, &.{ctx.view});
 
         for (ctx.calls.items) |call| {
-            gl.glBlendFuncSeparate(call.blend_func.src_rgb, call.blend_func.dst_rgb, call.blend_func.src_alpha, call.blend_func.dst_alpha);
+            gl.blendFuncSeparate(call.blend_func.src_rgb, call.blend_func.dst_rgb, call.blend_func.src_alpha, call.blend_func.dst_alpha);
             switch (call.call_type) {
                 .none => {},
                 .fill => call.fill(ctx),
@@ -694,12 +668,12 @@ fn renderFlush(uptr: *anyopaque) void {
             }
         }
 
-        gl.glDisableVertexAttribArray(0);
-        gl.glDisableVertexAttribArray(1);
-        gl.glDisable(gl.GL_CULL_FACE);
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0);
-        gl.glUseProgram(0);
-        gl.glBindTexture(gl.GL_TEXTURE_2D, 0);
+        gl.disableVertexAttribArray(0);
+        gl.disableVertexAttribArray(1);
+        gl.disable(.cull_face);
+        gl.bindBuffer(.invalid, .array_buffer);
+        gl.useProgram(.invalid);
+        gl.bindTexture(.invalid, .@"2d");
     }
 
     // Reset calls

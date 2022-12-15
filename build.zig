@@ -6,8 +6,12 @@ fn getRootDir() []const u8 {
 
 const root_dir = getRootDir();
 
-pub fn addNanoVGPackage(artifact: *std.build.LibExeObjStep) void {
-    artifact.addPackagePath("nanovg", root_dir ++ "/src/nanovg.zig");
+pub fn addNanoVGPackage(artifact: *std.build.LibExeObjStep, zgl: std.build.Pkg) void {
+    artifact.addPackage(.{
+        .name = "nanovg",
+        .source = .{ .path = root_dir ++ "/src/nanovg.zig" },
+        .dependencies = &.{zgl},
+    });
     artifact.addIncludePath(root_dir ++ "/src");
     artifact.addCSourceFile(root_dir ++ "/src/fontstash.c", &.{ "-DFONS_NO_STDIO", "-fno-stack-protector" });
     artifact.addCSourceFile(root_dir ++ "/src/stb_image.c", &.{ "-DSTBI_NO_STDIO", "-fno-stack-protector" });
