@@ -6,7 +6,7 @@ fn getRootDir() []const u8 {
 
 const root_dir = getRootDir();
 
-pub fn getPkg(zgl: std.build.Pkg) std.build.Pkg {
+pub fn getPkg(comptime zgl: std.build.Pkg) std.build.Pkg {
     return .{
         .name = "nanovg",
         .source = .{ .path = root_dir ++ "/src/nanovg.zig" },
@@ -14,12 +14,7 @@ pub fn getPkg(zgl: std.build.Pkg) std.build.Pkg {
     };
 }
 
-pub fn addNanoVGPackage(artifact: *std.build.LibExeObjStep, zgl: std.build.Pkg) void {
-    artifact.addPackage(.{
-        .name = "nanovg",
-        .source = .{ .path = root_dir ++ "/src/nanovg.zig" },
-        .dependencies = &.{zgl},
-    });
+pub fn link(artifact: *std.build.LibExeObjStep) void {
     artifact.addIncludePath(root_dir ++ "/src");
     artifact.addCSourceFile(root_dir ++ "/src/fontstash.c", &.{ "-DFONS_NO_STDIO", "-fno-stack-protector" });
     artifact.addCSourceFile(root_dir ++ "/src/stb_image.c", &.{ "-DSTBI_NO_STDIO", "-fno-stack-protector" });
@@ -63,6 +58,7 @@ pub fn build(b: *std.build.Builder) !void {
     }
     artifact.addIncludePath("examples");
     artifact.addCSourceFile("examples/stb_image_write.c", &.{ "-DSTBI_NO_STDIO", "-fno-stack-protector" });
-    addNanoVGPackage(artifact);
+    artifact.addPackage(getPkg(.{ .name = "zgl", .source = .{ .path = "dep/zgl/zgl.zig" } }));
+    link(artifact);
     artifact.install();
 }
